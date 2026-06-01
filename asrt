@@ -1,0 +1,189 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# asrt — a small, focused package uninstaller menu for Arch + Hyprland.
+# It does ONE thing: let you pick an explicitly-installed package from a rofi
+# menu, preview the exact set that would be removed, confirm, and remove it
+# cleanly with `pacman -Rns`. Nothing else.
+#
+# The entire UI is rofi in dmenu mode; there is no custom GUI code.
+
+# We deliberately do NOT use `set -e`: rofi returns nonzero when the user hits
+# Escape, and the `--print` dependency check is *expected* to fail sometimes.
+# Those are normal control-flow, not errors, so we check exit codes explicitly.
+# `-u` (error on unset vars) and `pipefail` are still worth keeping.
+set -uo pipefail
+
+# ─── Config ──────────────────────────────────────────────────────────────────
+# Everything you might want to swap lives here.
+
+# Launcher, in dmenu mode. Swap for fuzzel/walker by changing this array, e.g.
+#   LAUNCHER=(fuzzel --dmenu)
+# (Note: the -mesg/-no-custom flags below are rofi-specific.)
+LAUNCHER=(rofi -dmenu -i)
+
+# Command that produces the list of packages offered for removal.
+# Default: -Qetq = explicitly installed, NOT required by anything else, names only.
+# Alternative: `pacman -Qeq` also lists explicitly-installed packages that other
+# things depend on (so removing them may pull in a bigger blast radius).
+LIST_CMD=(pacman -Qetq)
+
+# Terminals tried, in order, for the privileged removal. The first one found on
+# PATH wins; $TERMINAL is honored first if you've set it. We do not hardcode a
+# single default, because a missing binary would launch nothing and fail
+# silently. kitty/foot take the command directly; alacritty/xterm need `-e`;
+# wezterm needs `start --` (handled in run_removal below).
+TERMINAL_CANDIDATES=("${TERMINAL:-}" kitty foot alacritty wezterm)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# menu: Omarchy-style wrapper around the launcher. Candidate lines come in on
+# stdin; the first arg is the prompt; any extra args are passed through to rofi
+# (e.g. -mesg, -no-custom).
+menu() {
+	local prompt="$1"
+	shift
+	"${LAUNCHER[@]}" -p "$prompt" "$@"
+}
+
+# pango_escape: rofi renders the -mesg header as Pango markup, so any dynamic
+# text we put there must have markup metacharacters escaped or it will garble
+# the display / emit parse warnings. pacman's dependency errors routinely
+# contain '>' (e.g. "breaks dependency 'bar>=2.0'"), so this is not optional.
+# '&' must be replaced first, otherwise we'd double-escape the '&' we introduce.
+# The '\&' in each replacement is required: under bash 5.2+ patsub_replacement
+# (on by default), a bare '&' in a ${var//pat/repl} replacement expands to the
+# matched text, so ">" would wrongly become ">gt;" instead of "&gt;".
+pango_escape() {
+	local s="$1"
+	s="${s//&/\&amp;}"
+	s="${s//</\&lt;}"
+	s="${s//>/\&gt;}"
+	printf '%s' "$s"
+}
+
+# info: show a single-button informational rofi screen (used for errors and the
+# empty-list case). -no-custom keeps the user from typing arbitrary input.
+info() {
+	local title="$1" mesg="$2"
+	printf '%s\n' "OK" | menu "$title" -mesg "$mesg" -no-custom >/dev/null
+}
+
+# pick_terminal: echo the first available terminal from TERMINAL_CANDIDATES.
+# Returns nonzero if none is found.
+pick_terminal() {
+	local t
+	for t in "${TERMINAL_CANDIDATES[@]}"; do
+		[[ -n "$t" ]] && command -v "$t" >/dev/null 2>&1 && {
+			printf '%s' "$t"
+			return 0
+		}
+	done
+	return 1
+}
+
+# run_removal: spawn $term running the real removal so sudo can prompt for a
+# password and the user can read pacman's output. The inner shell holds the
+# window open after pacman exits (otherwise it would vanish before you could
+# read "removed successfully", any .pacsave notes, or hook warnings).
+# We do NOT pass --noconfirm: pacman's own [Y/n] is the final source of truth,
+# even if the system changed between preview and execution.
+run_removal() {
+	local term="$1" pkg="$2"
+	# The single quotes are intentional: this is the inner shell's script, and
+	# "$1" must reach that shell literally so *it* expands it to $pkg (passed as
+	# the inner shell's positional arg below). Expanding here would be wrong.
+	# shellcheck disable=SC2016
+	local inner='sudo pacman -Rns "$1"; echo; read -rn1 -s -p "Done. Press any key to close."'
+	case "$term" in
+	kitty | foot) "$term" bash -c "$inner" _ "$pkg" ;;
+	wezterm) "$term" start -- bash -c "$inner" _ "$pkg" ;;
+	*) "$term" -e bash -c "$inner" _ "$pkg" ;; # alacritty, xterm, ...
+	esac
+
+	# Graphical alternative (no terminal): a polkit password dialog. Requires
+	# polkit. Uncomment and drop the terminal logic above if you prefer this.
+	# pkexec pacman -Rns "$pkg"
+}
+
+main() {
+	# 1. Offer the package list. Read with process substitution, NOT a pipe:
+	#    `cmd | mapfile` runs mapfile in a subshell and the array evaporates the
+	#    moment that subshell exits, leaving you with a silently empty menu.
+	local -a packages
+	mapfile -t packages < <("${LIST_CMD[@]}")
+	if ((${#packages[@]} == 0)); then
+		info "asrt" "Nothing to uninstall — no explicitly-installed, unneeded packages."
+		exit 0
+	fi
+
+	local pkg
+	pkg=$(printf '%s\n' "${packages[@]}" | menu "Uninstall")
+	# Escape or empty selection: exit cleanly, do nothing.
+	[[ -z "$pkg" ]] && exit 0
+
+	# 2. Compute the exact removal set (the "blast radius"). `--print` makes no
+	#    changes and touches no lock, so it needs no root. We capture stdout and
+	#    stderr together and branch on the exit status.
+	#    Note we preview with `-Rs`, not `-Rns`: current pacman refuses
+	#    `--nosave` together with `--print` ("may not be used together"), and
+	#    `-n` only controls whether config files are saved as .pacsave — it does
+	#    NOT change *which packages* are removed. So `-Rs --print` yields exactly
+	#    the package set that the real `-Rns` removal (step 5) will act on.
+	local out status
+	out=$(pacman -Rs --print --print-format '%n' "$pkg" 2>&1)
+	status=$?
+
+	# 3. Dependency-block branch: pacman refused (e.g. something else depends on
+	#    $pkg), so it can't be removed cleanly. Show the error and exit WITHOUT
+	#    removing anything. We deliberately do not try to "fix" this with a
+	#    cascade (-Rsc) or force (-Rdd) removal — that's not what v1 does.
+	if ((status != 0)); then
+		info "Cannot remove $pkg" \
+			"pacman will not remove <b>$(pango_escape "$pkg")</b> cleanly:
+
+$(pango_escape "$out")"
+		exit 0
+	fi
+
+	# 4. Confirmation screen. Put the package name and the full removal list in
+	#    the -mesg header (pango-escaped, defensively — package names are safe
+	#    but it costs nothing). Only Cancel/Remove are selectable, Cancel is
+	#    first so it's the highlighted default, and -no-custom blocks typed input.
+	local -a removal
+	mapfile -t removal <<<"$out"
+	local mesg
+	mesg="Removing <b>$(pango_escape "$pkg")</b> will remove ${#removal[@]} package(s):
+
+$(pango_escape "$out")"
+
+	local choice
+	choice=$(printf 'Cancel\nRemove\n' | menu "Confirm removal" -mesg "$mesg" -no-custom)
+	# Cancel, Escape, or empty: the safe default is to do nothing.
+	[[ "$choice" != "Remove" ]] && exit 0
+
+	# 5. Remove. In DRY_RUN mode, print the command instead of running it so this
+	#    destructive tool can be exercised safely.
+	if [[ -n "${DRY_RUN:-}" ]]; then
+		printf 'DRY_RUN: would run: sudo pacman -Rns %q\n' "$pkg"
+		exit 0
+	fi
+
+	local term
+	if ! term=$(pick_terminal); then
+		info "asrt" \
+			"$(pango_escape "No supported terminal found. Set \$TERMINAL or install one of: kitty, foot, alacritty, wezterm.")"
+		exit 1
+	fi
+	run_removal "$term" "$pkg"
+}
+
+# ─── Out of scope for v1 (intentionally not built; clean slots for later) ─────
+#  - Multi-select / batch removal: rofi supports -multi-select; step 1 would
+#    return several packages and steps 2-5 would loop or aggregate the set.
+#  - Installing / updating packages: a different tool; asrt only uninstalls.
+#  - Orphan cleanup (`pacman -Qdtq` → -Rns): would be its own menu entry.
+#  - Home-directory leftover-config scanning after removal.
+#  - Custom theming beyond the user's existing rofi theme.
+# ─────────────────────────────────────────────────────────────────────────────
+
+main "$@"
